@@ -309,9 +309,12 @@ class AxureParser:
         try:
             if not isinstance(ia_data, dict):
                 if isinstance(ia_data, str):
+                    action_str = str(ia_data)
+                    normalized = self._normalize_navigation_action(action_str, None)
                     return Interaction(
                         event=InteractionEvent.ON_CLICK,
-                        action=str(ia_data),
+                        action=normalized["action"],
+                        target=normalized["target"],
                     )
                 return None
             event_str = ia_data.get("event") or ia_data.get("trigger") or ia_data.get("on") or "onClick"
@@ -319,15 +322,125 @@ class AxureParser:
                 event = InteractionEvent(str(event_str))
             except (ValueError, TypeError):
                 event = InteractionEvent.ON_CLICK
-            action = ia_data.get("action") or ia_data.get("handler") or ia_data.get("do") or ia_data.get("description") or ""
-            target = ia_data.get("target") or ia_data.get("to") or ia_data.get("link")
+            raw_action = ia_data.get("action") or ia_data.get("handler") or ia_data.get("do") or ia_data.get("description") or ia_data.get("type") or ""
+            raw_target = ia_data.get("target") or ia_data.get("to") or ia_data.get("link") or ia_data.get("url") or ia_data.get("href") or ia_data.get("page") or ia_data.get("pageName") or ia_data.get("page_name") or ia_data.get("destination")
+            normalized = self._normalize_navigation_action(str(raw_action), str(raw_target) if raw_target else None)
+            raw_extra_target = ia_data.get("targetPage") or ia_data.get("target_page") or ia_data.get("openPage") or ia_data.get("open_page")
+            if normalized["target"] is None and raw_extra_target:
+                extra = self._normalize_navigation_action("", str(raw_extra_target))
+                normalized["target"] = extra["target"]
+                if normalized["action"] == "" and extra["action"]:
+                    normalized["action"] = extra["action"]
+            description = ia_data.get("description") or ia_data.get("desc") or ia_data.get("note") or ""
+            if not normalized["action"] and description:
+                desc_norm = self._normalize_navigation_action(str(description), None)
+                if desc_norm["action"]:
+                    normalized["action"] = desc_norm["action"]
+                if desc_norm["target"] and normalized["target"] is None:
+                    normalized["target"] = desc_norm["target"]
             return Interaction(
                 event=event,
-                action=str(action),
-                target=str(target) if target else None,
+                action=normalized["action"],
+                target=normalized["target"],
             )
         except Exception:
             return None
+
+    def _normalize_navigation_action(self, action_text: str, target_text: Optional[str]) -> Dict[str, Any]:
+        action_lower = (action_text or "").lower().strip()
+        target_lower = (target_text or "").lower().strip()
+        full_text = f"{action_lower} {target_lower}".strip()
+        url = None
+        if target_text and target_text.strip():
+            candidate = target_text.strip()
+            if self._looks_like_url(candidate):
+                url = candidate
+        if url is None:
+            import re
+            url_match = re.search(r"(https?://[^\s'\"]+|www\.[^\s'\"]+|[^\s'\"]+\.html[^\s'\"]*|[^\s'\"]+\.htm[^\s'\"]*|/[^\s'\"]*\.html|/[^\s'\"]*\.htm)", f"{action_text} {target_text or ''}", re.IGNORECASE)
+            if url_match:
+                url = url_match.group(1).strip()
+                if url.startswith("www."):
+                    url = "http://" + url
+        is_navigation = False
+        nav_keywords = [
+            "open link", "open url", "open in", "open page", "open window",
+            "navigate", "跳转", "打开", "跳转到", "跳至", "转到", "进入",
+            "link to", "goto", "go to", "redirect", "重定向",
+            "链接", "超链接", "访问", "点击访问", "前往",
+            "open in parent", "open in new", "open current", "new window",
+            "external link", "hyperlink", "current window", "new tab",
+        ]
+        for kw in nav_keywords:
+            if kw in full_text:
+                is_navigation = True
+                break
+        page_keywords = ["page", "页面", "页"]
+        has_page_ref = any(pk in full_text for pk in page_keywords)
+        if has_page_ref and url is None:
+            import re
+            page_ref = re.search(r"[\"'“”‘’]([^\"'“”‘’]+)[\"'“”‘’]", action_text + " " + (target_text or ""))
+            if page_ref:
+                url = page_ref.group(1).strip()
+                if not url.startswith("http") and not url.startswith("/") and not url.endswith(".html") and not url.endswith(".htm"):
+                    url = f"{self._slugify(url)}.html"
+            elif target_text and target_text.strip():
+                candidate = target_text.strip()
+                if not self._looks_like_url(candidate) and not candidate.startswith("http"):
+                    if not candidate.endswith(".html") and not candidate.endswith(".htm"):
+                        candidate = f"{self._slugify(candidate)}.html"
+                    url = candidate
+            else:
+                nav_patterns = [
+                    r"(?:跳转到|跳至|转到|进入|访问|前往|打开)\s*(?:页面|page|页)?\s*[:：]?\s*([^，。；,\s;\"'（）()【】\[\]]+?)(?:\s*(?:页面|page|页))?$",
+                    r"(?:navigate\s+to|goto|go\s+to|redirect\s+to|open\s+link|open)(?:\s+page)?\s*[:：]?\s*([^\s;\"',]+?)(?:\s*page)?$",
+                    r"页面\s*[:：]?\s*([^，。；,\s;\"'（）()【】\[\]]+?)(?:\s*(?:页面|page|页))?$",
+                    r"page\s*[:：]?\s*([^\s,;\"']+?)(?:\s*page)?$",
+                ]
+                for pat in nav_patterns:
+                    pm = re.search(pat, (action_text + " " + (target_text or "")).strip(), re.IGNORECASE)
+                    if pm:
+                        candidate = pm.group(1).strip()
+                        if candidate and not self._looks_like_url(candidate) and not candidate.startswith("http"):
+                            if not candidate.endswith(".html") and not candidate.endswith(".htm"):
+                                candidate = f"{self._slugify(candidate)}.html"
+                            url = candidate
+                            break
+        if is_navigation or url:
+            final_url = url or ""
+            if final_url and not final_url.startswith("http") and not final_url.startswith("/") and not final_url.startswith("#") and not final_url.startswith("javascript"):
+                if not final_url.endswith(".html") and not final_url.endswith(".htm") and "." not in final_url.split("/")[-1]:
+                    final_url = f"{self._slugify(final_url)}.html"
+            new_window = False
+            new_kw = ["new", "blank", "新", "_blank", "新窗口", "新标签", "新页面", "新打开"]
+            for nkw in new_kw:
+                if nkw in full_text:
+                    new_window = True
+                    break
+            action_prefix = "openNewWindow:" if new_window else "navigate:"
+            return {
+                "action": f"{action_prefix}{final_url}",
+                "target": final_url or None,
+            }
+        return {
+            "action": action_text.strip() if action_text else "",
+            "target": target_text.strip() if target_text else None,
+        }
+
+    def _looks_like_url(self, s: str) -> bool:
+        s = (s or "").strip().lower()
+        if s.startswith("http://") or s.startswith("https://") or s.startswith("www.") or s.startswith("/") or s.startswith("#") or s.startswith("javascript:"):
+            return True
+        if s.endswith(".html") or s.endswith(".htm") or s.endswith(".asp") or s.endswith(".aspx") or s.endswith(".php") or s.endswith(".jsp"):
+            return True
+        return False
+
+    def _slugify(self, s: str) -> str:
+        import re
+        s = (s or "").strip()
+        s = re.sub(r"[\s\-]+", "_", s)
+        s = re.sub(r"[^a-zA-Z0-9_\u4e00-\u9fff]", "", s)
+        return s or "page"
 
     def _parse_html(self, content: str, filename: str) -> ParseResult:
         soup = BeautifulSoup(content, "lxml")

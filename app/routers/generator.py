@@ -133,6 +133,7 @@ async def generate_html_only(
     try:
         content_type = request.headers.get("content-type", "")
         pages = []
+        include_interactions = True
         try:
             raw_body = await request.body()
             if raw_body:
@@ -142,12 +143,21 @@ async def generate_html_only(
                     pages = _coerce_pages(raw)
                 elif isinstance(raw, dict):
                     pages = _coerce_pages(raw.get("pages"))
+                    ii = raw.get("include_interactions") or raw.get("interactions")
+                    if ii is not None:
+                        include_interactions = _coerce_bool(ii, True)
         except Exception:
             pass
+        query_ii = request.query_params.get("include_interactions") or request.query_params.get("interactions")
+        if query_ii is not None:
+            include_interactions = _coerce_bool(query_ii, True)
         if not pages and ("application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type):
             try:
                 form = await request.form()
                 pages_str = form.get("pages")
+                form_ii = form.get("include_interactions") or form.get("interactions")
+                if form_ii is not None:
+                    include_interactions = _coerce_bool(form_ii, True)
                 if pages_str:
                     import json
                     try:
@@ -162,7 +172,7 @@ async def generate_html_only(
         req = GenerateRequest(
             pages=pages,
             format=GenerateFormat.HTML_ONLY,
-            include_interactions=False,
+            include_interactions=include_interactions,
             use_relative_position=True,
         )
         result = generate_code(req)

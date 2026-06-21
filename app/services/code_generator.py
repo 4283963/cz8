@@ -214,15 +214,45 @@ class CodeGenerator:
         if comp.name:
             attrs["data-name"] = comp.name
         attrs["data-type"] = comp.component_type.value
+
+        nav_info = None
+        if include_interactions and comp.interactions:
+            nav_info = self._extract_navigation(comp.interactions)
+            if nav_info and nav_info["url"]:
+                if comp.component_type == ComponentType.LINK:
+                    attrs["href"] = nav_info["url"]
+                    attrs["target"] = nav_info["target_attr"]
+                elif comp.component_type in (ComponentType.BUTTON, ComponentType.RECTANGLE, ComponentType.LABEL):
+                    attrs["data-navigate"] = nav_info["url"]
+                    attrs["data-nav-target"] = nav_info["target_attr"]
+                    if nav_info["in_new_window"]:
+                        attrs["title"] = f"点击打开: {nav_info['url']}"
+
         if include_interactions and comp.interactions:
             for ia in comp.interactions:
                 attr_name = self._event_to_attr(ia.event)
                 if attr_name:
-                    handler = self._escape_js_string(ia.action)
-                    attrs[attr_name] = handler
+                    if nav_info and attr_name == "onclick" and nav_info["url"]:
+                        handler = self._make_nav_onclick(nav_info)
+                    else:
+                        handler = self._make_inline_onclick(ia.action, ia.target, nav_info)
+                    if attr_name not in attrs:
+                        attrs[attr_name] = handler
         text_content = comp.text or ""
         if comp.component_type == ComponentType.BUTTON:
-            return self._build_tag("button", attrs, escape(text_content) or "按钮")
+            btn_tag = "button"
+            if nav_info and nav_info["url"]:
+                btn_tag = "a"
+                attrs["href"] = nav_info["url"]
+                attrs["target"] = nav_info["target_attr"]
+                if "onclick" in attrs and "navigate" in (attrs.get("onclick", "") or ""):
+                    del attrs["onclick"]
+                style_parts = []
+                if "style" in attrs:
+                    style_parts.append(attrs["style"])
+                style_parts.append("cursor:pointer; text-decoration:none; color:inherit; display:inline-flex; align-items:center; justify-content:center;")
+                attrs["style"] = " ".join(style_parts)
+            return self._build_tag(btn_tag, attrs, escape(text_content) or "按钮")
         elif comp.component_type == ComponentType.TEXT_INPUT:
             attrs["type"] = "text"
             if comp.placeholder:
@@ -235,17 +265,31 @@ class CodeGenerator:
                 attrs["placeholder"] = comp.placeholder
             return self._build_tag("textarea", attrs, comp.default_value or "")
         elif comp.component_type == ComponentType.LABEL:
-            return self._build_tag("div", attrs, escape(text_content) or "标签")
+            tag_name = "div"
+            if nav_info and nav_info["url"]:
+                tag_name = "a"
+                attrs["href"] = nav_info["url"]
+                attrs["target"] = nav_info["target_attr"]
+                if "onclick" in attrs and "navigate" in (attrs.get("onclick", "") or ""):
+                    del attrs["onclick"]
+                if "style" not in attrs:
+                    attrs["style"] = "cursor:pointer; text-decoration:none; color:inherit;"
+            return self._build_tag(tag_name, attrs, escape(text_content) or "标签")
         elif comp.component_type == ComponentType.IMAGE:
             attrs["src"] = comp.default_value or "data:image/svg+xml;charset=UTF-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='100' height='100'%3E%3Crect fill='%23eee' width='100' height='100'/%3E%3Ctext fill='%23aaa' font-family='Arial' font-size='14' x='50' y='55' text-anchor='middle'%3EImage%3C/text%3E%3C/svg%3E"
             attrs["alt"] = comp.name or text_content or "image"
+            if nav_info and nav_info["url"]:
+                wrapper_tag = "a"
+                wrapper_attrs = {"href": nav_info["url"], "target": nav_info["target_attr"], "style": "display:inline-block;"}
+                img_tag = self._build_self_closing_tag("img", attrs)
+                return self._build_tag(wrapper_tag, wrapper_attrs, img_tag)
             return self._build_self_closing_tag("img", attrs)
         elif comp.component_type == ComponentType.CHECKBOX:
             attrs["type"] = "checkbox"
             if comp.default_value:
                 attrs["checked"] = "checked"
             checkbox_tag = self._build_self_closing_tag("input", attrs)
-            wrapper_attrs = {"class": css_class, "style": f"position: absolute; left: {comp.position.x}px; top: {comp.position.y}px; display: inline-flex; align-items: center;"}
+            wrapper_attrs = {"class": css_class, "style": f"position: absolute; left: {comp.position.x}px; top: {comp.position.y}px; display: inline-flex; align-items: center; cursor: pointer;"}
             label_text = escape(text_content) or ""
             return f'<div {self._build_attrs_string(wrapper_attrs)}>{checkbox_tag}<span style="margin-left: 4px;">{label_text}</span></div>'
         elif comp.component_type == ComponentType.RADIO:
@@ -254,7 +298,7 @@ class CodeGenerator:
             if comp.default_value:
                 attrs["checked"] = "checked"
             radio_tag = self._build_self_closing_tag("input", attrs)
-            wrapper_attrs = {"class": css_class, "style": f"position: absolute; left: {comp.position.x}px; top: {comp.position.y}px; display: inline-flex; align-items: center;"}
+            wrapper_attrs = {"class": css_class, "style": f"position: absolute; left: {comp.position.x}px; top: {comp.position.y}px; display: inline-flex; align-items: center; cursor: pointer;"}
             label_text = escape(text_content) or ""
             return f'<div {self._build_attrs_string(wrapper_attrs)}>{radio_tag}<span style="margin-left: 4px;">{label_text}</span></div>'
         elif comp.component_type == ComponentType.DROPDOWN:
@@ -263,16 +307,87 @@ class CodeGenerator:
                 inner_options = f'<option value="" selected>{escape(comp.default_value)}</option>'
             return self._build_tag("select", attrs, inner_options)
         elif comp.component_type == ComponentType.LINK:
-            attrs["href"] = comp.default_value or "javascript:void(0)"
+            if "href" not in attrs:
+                attrs["href"] = comp.default_value or "javascript:void(0)"
+            if "target" not in attrs:
+                attrs["target"] = "_self"
             return self._build_tag("a", attrs, escape(text_content) or "链接")
         elif comp.component_type == ComponentType.TABLE:
             return self._build_tag("table", attrs, "<tr><td>单元格</td></tr>")
         elif comp.component_type == ComponentType.DYNAMIC_PANEL or comp.component_type == ComponentType.REPEATER:
             return self._build_tag("div", attrs, "")
         elif comp.component_type == ComponentType.RECTANGLE:
-            return self._build_tag("div", attrs, "")
+            tag = "div"
+            if nav_info and nav_info["url"]:
+                tag = "a"
+                attrs["href"] = nav_info["url"]
+                attrs["target"] = nav_info["target_attr"]
+                if "onclick" in attrs and "navigate" in (attrs.get("onclick", "") or ""):
+                    del attrs["onclick"]
+                if "style" not in attrs:
+                    attrs["style"] = "cursor:pointer; text-decoration:none; color:inherit; display:block;"
+            return self._build_tag(tag, attrs, "")
         else:
-            return self._build_tag("div", attrs, escape(text_content) if len(text_content) < 100 else "")
+            tag = "div"
+            if nav_info and nav_info["url"]:
+                tag = "a"
+                attrs["href"] = nav_info["url"]
+                attrs["target"] = nav_info["target_attr"]
+                if "onclick" in attrs and "navigate" in (attrs.get("onclick", "") or ""):
+                    del attrs["onclick"]
+                if "style" not in attrs:
+                    attrs["style"] = "cursor:pointer; text-decoration:none; color:inherit; display:block;"
+            return self._build_tag(tag, attrs, escape(text_content) if len(text_content) < 100 else "")
+
+    def _extract_navigation(self, interactions: List[Interaction]) -> Optional[Dict[str, Any]]:
+        for ia in interactions:
+            if ia.event == InteractionEvent.ON_CLICK:
+                url, in_new = self._parse_url_from_action(ia.action, ia.target)
+                if url:
+                    return {
+                        "url": url,
+                        "in_new_window": in_new,
+                        "target_attr": "_blank" if in_new else "_self",
+                    }
+        for ia in interactions:
+            url, in_new = self._parse_url_from_action(ia.action, ia.target)
+            if url:
+                return {
+                    "url": url,
+                    "in_new_window": in_new,
+                    "target_attr": "_blank" if in_new else "_self",
+                }
+        return None
+
+    def _parse_url_from_action(self, action: str, target: Optional[str]) -> tuple[str, bool]:
+        action = action or ""
+        target = target or ""
+        if action.startswith("navigate:"):
+            url = action[9:].strip()
+            return url, False
+        if action.startswith("openNewWindow:"):
+            url = action[14:].strip()
+            return url, True
+        if action.startswith("open:"):
+            url = action[5:].strip()
+            return url, True
+        in_new = False
+        full = f"{action} {target}"
+        new_kw = ["new", "blank", "_blank", "新窗口", "新标签", "新页面", "新打开", "external", "外链"]
+        for nk in new_kw:
+            if nk in full.lower():
+                in_new = True
+                break
+        url = None
+        import re
+        url_match = re.search(r"(https?://[^\s'\"]+|www\.[^\s'\"]+|/[^\s'\"]+\.html?|/[^\s'\"]+\.php|/[^\s'\"]+\.aspx?|[^\s'\"]+\.html?|/[a-zA-Z0-9_\-/]+)", full)
+        if url_match:
+            url = url_match.group(1).strip()
+            if url.startswith("www."):
+                url = "http://" + url
+        if not url and target and target.strip() and target.lower().startswith(("http", "www", "/", "#")):
+            url = target.strip()
+        return (url or "", in_new)
 
     def _generate_component_js(self, comp: AxureComponent, css_class: str) -> str:
         lines = []
@@ -290,18 +405,57 @@ class CodeGenerator:
         if action.startswith("navigate:"):
             url = action[9:]
             return f"window.location.href = '{self._escape_js_string(url)}';"
+        if action.startswith("openNewWindow:"):
+            url = action[14:]
+            return f"window.open('{self._escape_js_string(url)}', '_blank');"
+        if action.startswith("open:"):
+            url = action[5:]
+            return f"window.open('{self._escape_js_string(url)}', '_blank');"
         if action.startswith("show:"):
             target_id = action[5:]
             return f"var el = document.getElementById('{self._escape_js_string(target_id)}'); if(el) el.style.display = 'block';"
         if action.startswith("hide:"):
             target_id = action[5:]
             return f"var el = document.getElementById('{self._escape_js_string(target_id)}'); if(el) el.style.display = 'none';"
+        if action.startswith("toggle:"):
+            target_id = action[7:]
+            return f"var el = document.getElementById('{self._escape_js_string(target_id)}'); if(el) el.style.display = (el.style.display === 'none') ? 'block' : 'none';"
         if action.startswith("alert:"):
             msg = action[6:]
             return f"alert('{self._escape_js_string(msg)}');"
+        import re
+        inline_url = re.search(r"(https?://[^\s'\"]+|www\.[^\s'\"]+|[^\s'\"]+\.html?|/[^\s'\"]+\.html?)", f"{action} {target}", re.IGNORECASE)
+        if inline_url:
+            url = inline_url.group(1)
+            if url.startswith("www."):
+                url = "http://" + url
+            is_new = any(kw in f"{action} {target}".lower() for kw in ["new", "blank", "_blank", "新窗口", "新标签", "外链", "external"])
+            if is_new:
+                return f"window.open('{self._escape_js_string(url)}', '_blank');"
+            return f"window.location.href = '{self._escape_js_string(url)}';"
+        nav_kw = ["跳转", "打开", "跳转到", "跳至", "转到", "进入", "访问", "navigate", "goto", "go to", "redirect", "链接"]
+        is_nav = any(nk in f"{action} {target}".lower() for nk in nav_kw)
+        if is_nav and target and target.strip():
+            is_new = any(kw in f"{action} {target}".lower() for kw in ["new", "blank", "_blank", "新窗口", "新标签", "外链", "external"])
+            if is_new:
+                return f"window.open('{self._escape_js_string(target)}', '_blank');"
+            return f"window.location.href = '{self._escape_js_string(target)}';"
         if target and target.startswith("http"):
             return f"window.open('{self._escape_js_string(target)}', '_blank');"
         return f"console.log('{self._escape_js_string(action)}', e);"
+
+    def _make_nav_onclick(self, nav_info: Dict[str, Any]) -> str:
+        url = nav_info["url"]
+        if nav_info["in_new_window"]:
+            return f"window.open('{self._escape_js_string(url)}', '_blank'); return false;"
+        return f"window.location.href='{self._escape_js_string(url)}'; return false;"
+
+    def _make_inline_onclick(self, action: str, target: Optional[str], nav_info: Optional[Dict[str, Any]]) -> str:
+        raw = self._interaction_to_js(action or "", target or "")
+        if raw.startswith("console.log"):
+            escaped = self._escape_js_string(action or "(无动作)")
+            return f"console.log('{escaped}', this);"
+        return raw
 
     def _event_to_attr(self, event: InteractionEvent) -> str:
         mapping = {
