@@ -52,30 +52,54 @@ class AxureParser:
 
     def _parse_json(self, content: str, filename: str) -> ParseResult:
         try:
+            content = content.strip()
+            if content.startswith(("'", '"')) and len(content) >= 2:
+                content = content[1:-1]
             data = json.loads(content)
         except json.JSONDecodeError as e:
-            return ParseResult(
-                success=False,
-                message=f"JSON解析错误: {str(e)}",
-                source_type="json",
-                pages=[],
-            )
+            fixed = self._try_fix_json(content)
+            if fixed is not None:
+                data = fixed
+            else:
+                return ParseResult(
+                    success=False,
+                    message=f"JSON解析错误: {str(e)}",
+                    source_type="json",
+                    pages=[],
+                )
         pages = []
         if isinstance(data, list):
             for idx, page_data in enumerate(data):
+                if not isinstance(page_data, dict):
+                    continue
                 page = self._json_to_page(page_data, f"{filename or 'page'}_{idx + 1}")
                 if page:
                     pages.append(page)
         elif isinstance(data, dict):
-            if "pages" in data and isinstance(data["pages"], list):
-                for idx, page_data in enumerate(data["pages"]):
-                    page = self._json_to_page(page_data, page_data.get("name", f"page_{idx + 1}"))
+            pages_data = None
+            for key in ["pages", "page", "screens", "views", "data"]:
+                val = data.get(key)
+                if isinstance(val, list):
+                    pages_data = val
+                    break
+            if pages_data:
+                for idx, page_data in enumerate(pages_data):
+                    if not isinstance(page_data, dict):
+                        continue
+                    page = self._json_to_page(page_data, page_data.get("name") or page_data.get("page_name") or f"page_{idx + 1}")
                     if page:
                         pages.append(page)
             else:
                 page = self._json_to_page(data, filename or "page_1")
                 if page:
                     pages.append(page)
+        if not pages:
+            return ParseResult(
+                success=False,
+                message="未解析到有效的页面数据",
+                source_type="json",
+                pages=[],
+            )
         return ParseResult(
             success=True,
             message=f"解析成功，共 {len(pages)} 个页面",
@@ -83,64 +107,128 @@ class AxureParser:
             pages=pages,
         )
 
-    def _json_to_page(self, page_data: Dict[str, Any], page_name: str) -> Optional[AxurePage]:
+    def _try_fix_json(self, content: str) -> Optional[Any]:
         try:
-            name = page_data.get("page_name") or page_data.get("name") or page_name
-            size_data = page_data.get("page_size") or page_data.get("size") or {}
+            fixed = content.replace("'", '"')
+            import re
+            fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
+            fixed = re.sub(r'(\w+)(\s*:)', r'"\1"\2', fixed)
+            return json.loads(fixed)
+        except Exception:
+            return None
+
+    def _to_float(self, val: Any, default: float = 0.0) -> float:
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return default
+
+    def _to_int(self, val: Any, default: int = 0) -> int:
+        if val is None:
+            return default
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return default
+
+    def _to_dict(self, val: Any) -> Dict[str, Any]:
+        if isinstance(val, dict):
+            return val
+        return {}
+
+    def _to_list(self, val: Any) -> List[Any]:
+        if isinstance(val, list):
+            return val
+        return []
+
+    def _json_to_page(self, page_data: Any, page_name: str) -> Optional[AxurePage]:
+        try:
+            if not isinstance(page_data, dict):
+                page_data = {}
+            name = page_data.get("page_name") or page_data.get("name") or page_data.get("title") or page_name
+            size_data = self._to_dict(page_data.get("page_size") or page_data.get("size") or page_data.get("canvas") or {})
             page_size = Size(
-                width=float(size_data.get("width", 1440)),
-                height=float(size_data.get("height", 900)),
+                width=self._to_float(size_data.get("width"), 1440),
+                height=self._to_float(size_data.get("height"), 900),
             )
-            page_url = page_data.get("page_url")
-            components_data = page_data.get("components") or page_data.get("widgets") or page_data.get("elements") or []
-            components = [self._json_to_component(c) for c in components_data]
-            components = [c for c in components if c is not None]
+            page_url = page_data.get("page_url") or page_data.get("url")
+            comp_keys = ["components", "widgets", "elements", "items", "children", "nodes"]
+            components_data = []
+            for k in comp_keys:
+                val = page_data.get(k)
+                if isinstance(val, list) and val:
+                    components_data = val
+                    break
+            components = []
+            for c in components_data:
+                comp = self._json_to_component(c)
+                if comp:
+                    components.append(comp)
             return AxurePage(
-                page_name=name,
+                page_name=str(name) if name else page_name,
                 page_size=page_size,
                 components=components,
-                page_url=page_url,
+                page_url=str(page_url) if page_url else None,
             )
         except Exception:
             return None
 
-    def _json_to_component(self, comp_data: Dict[str, Any]) -> Optional[AxureComponent]:
+    def _json_to_component(self, comp_data: Any) -> Optional[AxureComponent]:
         try:
-            comp_id = comp_data.get("id") or generate_component_id()
-            comp_type_str = comp_data.get("component_type") or comp_data.get("type") or "unknown"
+            if not isinstance(comp_data, dict):
+                return None
+            comp_id = comp_data.get("id") or comp_data.get("widgetId") or comp_data.get("uid") or generate_component_id()
+            comp_type_str = comp_data.get("component_type") or comp_data.get("type") or comp_data.get("widgetType") or "unknown"
             try:
-                component_type = ComponentType(comp_type_str)
-            except ValueError:
+                component_type = ComponentType(str(comp_type_str))
+            except (ValueError, TypeError):
                 component_type = ComponentType.UNKNOWN
-            pos_data = comp_data.get("position") or {}
+            pos_data = self._to_dict(comp_data.get("position") or comp_data.get("pos") or comp_data.get("location") or {})
+            if not pos_data:
+                pos_data = {
+                    "x": self._to_float(comp_data.get("x") or comp_data.get("left"), 0),
+                    "y": self._to_float(comp_data.get("y") or comp_data.get("top"), 0),
+                }
             position = Position(
-                x=float(pos_data.get("x", 0)),
-                y=float(pos_data.get("y", 0)),
+                x=self._to_float(pos_data.get("x") or pos_data.get("left"), 0),
+                y=self._to_float(pos_data.get("y") or pos_data.get("top"), 0),
             )
-            size_data = comp_data.get("size") or {}
+            size_data = self._to_dict(comp_data.get("size") or {})
+            if not size_data:
+                size_data = {
+                    "width": self._to_float(comp_data.get("width"), 0),
+                    "height": self._to_float(comp_data.get("height"), 0),
+                }
             size = Size(
-                width=float(size_data.get("width", 0)),
-                height=float(size_data.get("height", 0)),
+                width=self._to_float(size_data.get("width"), 0),
+                height=self._to_float(size_data.get("height"), 0),
             )
-            style = self._parse_json_style(comp_data.get("style") or {})
+            style = self._parse_json_style(comp_data.get("style") or comp_data.get("styles") or {})
             interactions = []
-            for ia in comp_data.get("interactions") or []:
-                interactions.append(self._parse_json_interaction(ia))
+            for ia in self._to_list(comp_data.get("interactions") or comp_data.get("events") or comp_data.get("actions") or []):
+                parsed = self._parse_json_interaction(ia)
+                if parsed:
+                    interactions.append(parsed)
             children = []
-            for child in comp_data.get("children") or []:
+            for child in self._to_list(comp_data.get("children") or comp_data.get("items") or comp_data.get("nested") or []):
                 child_comp = self._json_to_component(child)
                 if child_comp:
                     children.append(child_comp)
+            text = comp_data.get("text") or comp_data.get("label") or comp_data.get("content")
+            placeholder = comp_data.get("placeholder") or comp_data.get("hint")
+            default_value = comp_data.get("default_value") or comp_data.get("value") or comp_data.get("default")
             return AxureComponent(
-                id=comp_id,
-                name=comp_data.get("name"),
+                id=str(comp_id),
+                name=str(comp_data.get("name") or comp_data.get("label")) if comp_data.get("name") or comp_data.get("label") else None,
                 component_type=component_type,
                 position=position,
                 size=size,
                 style=style,
-                text=comp_data.get("text"),
-                placeholder=comp_data.get("placeholder"),
-                default_value=comp_data.get("default_value"),
+                text=str(text) if text is not None else None,
+                placeholder=str(placeholder) if placeholder is not None else None,
+                default_value=str(default_value) if default_value is not None else None,
                 interactions=interactions,
                 children=children,
                 raw_data=comp_data,
@@ -148,49 +236,98 @@ class AxureParser:
         except Exception:
             return None
 
-    def _parse_json_style(self, style_data: Dict[str, Any]) -> Optional[ComponentStyle]:
-        if not style_data:
+    def _parse_json_style(self, style_data: Any) -> Optional[ComponentStyle]:
+        if not style_data or not isinstance(style_data, dict):
             return None
-        border_data = style_data.get("border")
-        border = None
-        if border_data:
-            border = BorderStyle(
-                width=border_data.get("width"),
-                style=border_data.get("style"),
-                color=border_data.get("color"),
-                radius=border_data.get("radius"),
-            )
-        text_data = style_data.get("text_style")
-        text_style = None
-        if text_data:
-            text_style = TextStyle(
-                font_family=text_data.get("font_family"),
-                font_size=text_data.get("font_size"),
-                font_weight=text_data.get("font_weight"),
-                color=text_data.get("color"),
-                text_align=text_data.get("text_align"),
-                line_height=text_data.get("line_height"),
-            )
-        return ComponentStyle(
-            background_color=parse_hex_color(style_data.get("background_color") or style_data.get("bg_color") or ""),
-            opacity=style_data.get("opacity"),
-            border=border,
-            text_style=text_style,
-            padding=style_data.get("padding"),
-            shadow=style_data.get("shadow"),
-        )
-
-    def _parse_json_interaction(self, ia_data: Dict[str, Any]) -> Interaction:
-        event_str = ia_data.get("event") or ia_data.get("trigger") or "onClick"
+        has_style = False
         try:
-            event = InteractionEvent(event_str)
-        except ValueError:
-            event = InteractionEvent.ON_CLICK
-        return Interaction(
-            event=event,
-            action=ia_data.get("action") or ia_data.get("handler") or "",
-            target=ia_data.get("target"),
-        )
+            border_data = style_data.get("border") or style_data.get("borderStyle")
+            border = None
+            if border_data:
+                if isinstance(border_data, dict):
+                    border = BorderStyle(
+                        width=self._to_float(border_data.get("width") or border_data.get("borderWidth"), None),
+                        style=str(border_data.get("style") or border_data.get("borderStyle")) if border_data.get("style") or border_data.get("borderStyle") else None,
+                        color=parse_hex_color(str(border_data.get("color") or border_data.get("borderColor") or "")) if (border_data.get("color") or border_data.get("borderColor")) else None,
+                        radius=self._to_float(border_data.get("radius") or border_data.get("borderRadius") or border_data.get("cornerRadius"), None),
+                    )
+                elif isinstance(border_data, str):
+                    border_parts = border_data.split()
+                    bw, bs, bc = None, None, None
+                    for p in border_parts:
+                        if "px" in p or re.match(r"^\d+(\.\d+)?$", p):
+                            bw = self._to_float(p, None)
+                        elif p in ["solid", "dashed", "dotted", "double", "none"]:
+                            bs = p
+                        else:
+                            bc = parse_hex_color(p) or p
+                    border = BorderStyle(width=bw, style=bs, color=bc, radius=None)
+                if border:
+                    has_style = True
+            text_data = style_data.get("text_style") or style_data.get("textStyle") or style_data.get("font")
+            text_style = None
+            if text_data:
+                if isinstance(text_data, dict):
+                    ts = TextStyle(
+                        font_family=str(text_data.get("font_family") or text_data.get("fontFamily") or text_data.get("font")) if (text_data.get("font_family") or text_data.get("fontFamily") or text_data.get("font")) else None,
+                        font_size=self._to_float(text_data.get("font_size") or text_data.get("fontSize"), None),
+                        font_weight=str(text_data.get("font_weight") or text_data.get("fontWeight")) if (text_data.get("font_weight") or text_data.get("fontWeight")) else None,
+                        color=parse_hex_color(str(text_data.get("color") or "")) if text_data.get("color") else None,
+                        text_align=str(text_data.get("text_align") or text_data.get("textAlign") or text_data.get("align")) if (text_data.get("text_align") or text_data.get("textAlign") or text_data.get("align")) else None,
+                        line_height=self._to_float(text_data.get("line_height") or text_data.get("lineHeight"), None),
+                    )
+                    has_style = True
+                    any_set = any([ts.font_family, ts.font_size is not None, ts.font_weight, ts.color, ts.text_align, ts.line_height is not None])
+                    if any_set:
+                        text_style = ts
+            bg_color = parse_hex_color(str(style_data.get("background_color") or style_data.get("bg_color") or style_data.get("backgroundColor") or style_data.get("bg") or ""))
+            bg_color = bg_color if bg_color and bg_color.strip() and bg_color not in ["transparent", "none"] else None
+            opacity = style_data.get("opacity")
+            if opacity is not None:
+                try:
+                    opacity = float(opacity)
+                except (ValueError, TypeError):
+                    opacity = None
+            padding = style_data.get("padding")
+            shadow = style_data.get("shadow") or style_data.get("boxShadow")
+            if bg_color or opacity is not None or border or text_style or padding or shadow:
+                has_style = True
+            if not has_style:
+                return None
+            return ComponentStyle(
+                background_color=bg_color,
+                opacity=opacity,
+                border=border,
+                text_style=text_style,
+                padding=padding if isinstance(padding, dict) else None,
+                shadow=bool(shadow) if shadow is not None else None,
+            )
+        except Exception:
+            return None
+
+    def _parse_json_interaction(self, ia_data: Any) -> Optional[Interaction]:
+        try:
+            if not isinstance(ia_data, dict):
+                if isinstance(ia_data, str):
+                    return Interaction(
+                        event=InteractionEvent.ON_CLICK,
+                        action=str(ia_data),
+                    )
+                return None
+            event_str = ia_data.get("event") or ia_data.get("trigger") or ia_data.get("on") or "onClick"
+            try:
+                event = InteractionEvent(str(event_str))
+            except (ValueError, TypeError):
+                event = InteractionEvent.ON_CLICK
+            action = ia_data.get("action") or ia_data.get("handler") or ia_data.get("do") or ia_data.get("description") or ""
+            target = ia_data.get("target") or ia_data.get("to") or ia_data.get("link")
+            return Interaction(
+                event=event,
+                action=str(action),
+                target=str(target) if target else None,
+            )
+        except Exception:
+            return None
 
     def _parse_html(self, content: str, filename: str) -> ParseResult:
         soup = BeautifulSoup(content, "lxml")
